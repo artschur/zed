@@ -1,17 +1,17 @@
 use anyhow::{Context as _, Result};
 use buffer_diff::{BufferDiff, BufferDiffSnapshot};
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle};
-use editor::{Addon, Editor, EditorEvent, ExcerptId, ExcerptRange, MultiBuffer};
+use editor::{Addon, Anchor, Editor, EditorEvent, ExcerptId, ExcerptRange, MultiBuffer};
 use git::repository::{CommitDetails, CommitDiff, RepoPath};
 use git::{GitHostingProviderRegistry, GitRemote, parse_git_remote_url};
 use gpui::{
     AnyElement, App, AppContext as _, Asset, AsyncApp, AsyncWindowContext, Context, Element,
     Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    PromptLevel, Render, Styled, Task, WeakEntity, Window, actions,
+    PromptLevel, Render, Styled, StyledImage, Task, WeakEntity, Window, actions,
 };
 use language::{
-    Anchor, Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, ReplicaId, Rope,
-    TextBuffer, ToPoint,
+    Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, ReplicaId, Rope, TextBuffer,
+    ToPoint,
 };
 use multi_buffer::ExcerptInfo;
 use multi_buffer::PathKey;
@@ -169,11 +169,17 @@ impl CommitView {
         let repository_clone = repository.clone();
         let commit_message = commit.message.clone();
 
-        cx.spawn(async move |this, cx| {
+        // create a block properties vector
+        let mut image_blocks: Vec<BlockProperties<Anchor>> = Vec::new();
+        cx.spawn(async move |this, mut cx| {
             for file in commit_diff.files {
                 let is_deleted = file.new_text.is_none();
                 let new_text = file.new_text.unwrap_or_default();
                 let old_text = file.old_text;
+
+                let old_content = file.old_content;
+                let new_content = file.new_content;
+
                 let worktree_id = repository_clone
                     .update(cx, |repository, cx| {
                         repository
@@ -195,8 +201,73 @@ impl CommitView {
                     path: file.path.clone(),
                     is_deleted,
                     worktree_id,
-                    display_name,
+                    display_name: display_name.clone(),
                 }) as Arc<dyn language::File>;
+
+                let is_image = new_content.is_some() || old_content.is_some();
+                if is_image {
+                    let old_image_opt =
+                        old_content.as_deref().and_then(Self::load_image_from_bytes);
+
+                    let new_image_opt =
+                        new_content.as_deref().and_then(Self::load_image_from_bytes);
+
+                    let (buffer, anchor) = this.update(cx, |this, cx| {
+                        this.multibuffer.update(cx, |mb, cx| {
+                            let header = display_name.to_string();
+                            let buffer = cx.new(|cx| Buffer::local(header, cx));
+                            let ranges = vec![ExcerptRange {
+                                context: Anchor::MIN..Anchor::MAX,
+                                primary: Anchor::MIN..Anchor::MAX,
+                            }];
+
+                            let id = mb.push_excerpts(buffer.clone(), ranges, cx)[0];
+                            let anchor =
+                                mb.buffer_to_anchor(&buffer.read(cx).snapshot(), Anchor::MIN, cx);
+                            (buffer, anchor)
+                        })
+                    })?;
+
+                    let block = BlockProperties {
+                        placement: BlockPlacement::Below(anchor),
+                        height: Some(10),
+                        style: BlockStyle::Fixed,
+                        priority: 0,
+
+                        render: Arc::new(move |_cx| {
+                            let old_view = if let Some(img) = &old_image_opt {
+                                gpui::img(img.clone())
+                                    .object_fit(gpui::ObjectFit::ScaleDown)
+                                    .h_full()
+                                    .w_full()
+                                    .into_any_element()
+                            } else {
+                                gpui::div().child("(new file)").into_any_element()
+                            };
+
+                            let new_view = if let Some(img) = &new_image_opt {
+                                gpui::img(img.clone())
+                                    .object_fit(gpui::ObjectFit::ScaleDown)
+                                    .h_full()
+                                    .w_full()
+                                    .into_any_element()
+                            } else {
+                                gpui::div().child("(deleted)").into_any_element()
+                            };
+
+                            h_flex()
+                                .h_full()
+                                .w_full()
+                                .gap_4()
+                                .child(old_view)
+                                .child(new_view)
+                                .into_any_element()
+                        }),
+                    };
+
+                    image_blocks.push(block);
+                    continue;
+                }
 
                 let buffer = build_buffer(new_text, file, &language_registry, cx).await?;
                 let buffer_diff =
@@ -236,6 +307,14 @@ impl CommitView {
                             cx,
                         );
                         multibuffer.add_diff(buffer_diff, cx);
+                    });
+                })?;
+            }
+
+            if !image_blocks.is_empty() {
+                this.update(cx, |this, cx| {
+                    this.editor.update(cx, |editor, cx| {
+                        editor.insert_blocks(image_blocks, None, cx);
                     });
                 })?;
             }
@@ -318,6 +397,26 @@ impl CommitView {
             repository,
             remote,
         }
+    }
+
+    fn load_image_from_bytes(bytes: &[u8]) -> Option<Arc<gpui::Image>> {
+        let format = image::guess_format(bytes).ok()?;
+
+        let gpui_format = match format {
+            image::ImageFormat::Png => gpui::ImageFormat::Png,
+            image::ImageFormat::Jpeg => gpui::ImageFormat::Jpeg,
+            image::ImageFormat::WebP => gpui::ImageFormat::Webp,
+            image::ImageFormat::Gif => gpui::ImageFormat::Gif,
+            image::ImageFormat::Bmp => gpui::ImageFormat::Bmp,
+            image::ImageFormat::Tiff => gpui::ImageFormat::Tiff,
+            image::ImageFormat::Ico => gpui::ImageFormat::Ico,
+            _ => return None,
+        };
+
+        Some(Arc::new(gpui::Image::from_bytes(
+            gpui_format,
+            bytes.to_vec(),
+        )))
     }
 
     fn render_commit_avatar(

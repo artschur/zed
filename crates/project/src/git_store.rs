@@ -4067,6 +4067,8 @@ impl Repository {
                                     path: RepoPath::from_proto(&file.path)?,
                                     old_text: file.old_text,
                                     new_text: file.new_text,
+                                    old_content: None,
+                                    new_content: None,
                                 })
                             })
                             .collect::<Result<Vec<_>>>()?,

@@ -233,6 +233,8 @@ pub struct CommitFile {
     pub path: RepoPath,
     pub old_text: Option<String>,
     pub new_text: Option<String>,
+    pub old_content: Option<Vec<u8>>,
+    pub new_content: Option<Vec<u8>>,
 }
 
 impl CommitDetails {
@@ -860,10 +862,24 @@ impl GitRepository for RealGitRepository {
                 let mut text = vec![0; len];
                 stdout.read_exact(&mut text).await?;
                 stdout.read_exact(&mut newline).await?;
-                let text = String::from_utf8_lossy(&text).to_string();
+
+                let try_decoding_to_str = |bytes: Vec<u8>| -> (Option<String>, Option<Vec<u8>>) {
+                    // Try as valid utf-8, if fails its binary
+                    match String::from_utf8(bytes) {
+                        Ok(s) => (Some(s), None),
+                        Err(e) => (None, Some(e.into_bytes())),
+                    }
+                };
 
                 let mut old_text = None;
                 let mut new_text = None;
+
+                // for binary files (images)
+                let mut old_content = None;
+                let mut new_content = None;
+
+                let (primary_new_text, primary_new_content) = try_decoding_to_str(text);
+
                 match status_code {
                     StatusCode::Modified => {
                         info_line.clear();
@@ -874,11 +890,23 @@ impl GitRepository for RealGitRepository {
                         let mut parent_text = vec![0; len];
                         stdout.read_exact(&mut parent_text).await?;
                         stdout.read_exact(&mut newline).await?;
-                        old_text = Some(String::from_utf8_lossy(&parent_text).to_string());
-                        new_text = Some(text);
+
+                        let (parent_text, parent_binary) = try_decoding_to_str(parent_text);
+
+                        old_text = parent_text;
+                        new_text = primary_new_text;
+
+                        old_content = parent_binary;
+                        new_content = primary_new_content;
                     }
-                    StatusCode::Added => new_text = Some(text),
-                    StatusCode::Deleted => old_text = Some(text),
+                    StatusCode::Added => {
+                        new_text = primary_new_text;
+                        new_content = primary_new_content;
+                    }
+                    StatusCode::Deleted => {
+                        old_text = primary_new_text;
+                        old_content = primary_new_content;
+                    }
                     _ => continue,
                 }
 
@@ -886,6 +914,8 @@ impl GitRepository for RealGitRepository {
                     path: RepoPath(Arc::from(rel_path)),
                     old_text,
                     new_text,
+                    old_content,
+                    new_content,
                 })
             }
 
